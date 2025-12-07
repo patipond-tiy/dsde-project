@@ -26,7 +26,7 @@ def thai_tokenizer(text):
 st.set_page_config(page_title="Traffy Fondue Predictor", layout="wide")
 
 @st.cache_resource
-def load_model_resources_v4():
+def load_model_resources_v5():
     # Load the dictionary containing model and transformers
     artifacts = joblib.load(MODEL_PATH)
     return artifacts
@@ -61,7 +61,7 @@ def main():
     st.markdown("Predict resolution times and analyze district performance in Bangkok.")
 
     # Load Resources
-    artifacts = load_model_resources_v4()
+    artifacts = load_model_resources_v5()
     model = artifacts['model']
     
     # Load Data for Dropdowns

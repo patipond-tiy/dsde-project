@@ -12,7 +12,9 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pythainlp.tokenize import word_tokenize
-from sklearn.utils.class_weight import compute_sample_weight
+from tqdm import tqdm
+from resampling_utils import hybrid_resample_regression
+from evaluation_utils import evaluate_by_bins, plot_predictions_by_range, calculate_balance_score
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,21 +66,51 @@ def train_robust_model(df):
     df = df.sort_values('timestamp', ascending=False).head(250000)
     
     df['target_capped'] = df[target_col].clip(upper=365)
-    y = np.log1p(df['target_capped'])
-    X = df[feature_cols]
 
-    # 5. Handle Unbalanced Dataset via Sample Weights
-    # We calculate weights inversely proportional to the frequency of 'type_clean'.
-    # Rare types (like 'Bridge') get higher weight.
-    print("Calculating Sample Weights...")
-    sample_weights = compute_sample_weight(class_weight='balanced', y=df['type_clean'])
-    
-    # 6. Split Data
+    # 5. Apply Hybrid Resampling (Undersample + Oversample)
+    # Address target imbalance by balancing the distribution across time ranges
+    # V2: More aggressive oversampling for 90+ days, less aggressive undersampling
+    bins = [0, 7, 30, 90, 180, 365]
+    labels = ['0-7d', '7-30d', '30-90d', '90-180d', '180-365d']
+    target_distribution = {
+        '0-7d': 100000,    # 33% - Keep more low-value patterns
+        '7-30d': 55000,    # 18% - Keep almost all
+        '30-90d': 50000,   # 17% - Moderate oversample
+        '90-180d': 50000,  # 17% - AGGRESSIVE oversample (259% increase!)
+        '180-365d': 45000  # 15% - VERY AGGRESSIVE oversample (342% increase!)
+    }
+
+    df_balanced = hybrid_resample_regression(
+        df,
+        target_col='target_capped',
+        bins=bins,
+        target_distribution=target_distribution,
+        random_state=42
+    )
+
+    # 5b. Add Sample Weights on Top of Resampling
+    # Even after resampling, give extra weight to high-value cases during training
+    print("Assigning sample weights...")
+    bin_weights = {
+        '0-7d': 0.5,       # Lower weight for over-represented class
+        '7-30d': 0.8,
+        '30-90d': 1.0,     # Baseline weight
+        '90-180d': 1.5,    # 50% extra weight
+        '180-365d': 2.0    # 2x weight for highest-value cases
+    }
+    df_balanced['sample_weight'] = df_balanced['bin'].map(bin_weights)
+
+    # Update y and X from resampled dataframe
+    y = np.log1p(df_balanced['target_capped'])
+    X = df_balanced[feature_cols]
+
+    # 6. Split Data with Stratification
     # We need to split the LINEAR target as well for proper encoding
-    y_lin = df['target_capped']
-    
+    y_lin = df_balanced['target_capped']
+
+    # Stratified split ensures test set has similar distribution to training set
     X_train, X_test, y_train, y_test, y_train_lin, y_test_lin, w_train, w_test = train_test_split(
-        X, y, y_lin, sample_weights, test_size=0.2, random_state=42
+        X, y, y_lin, df_balanced['sample_weight'], test_size=0.2, random_state=42, stratify=df_balanced['bin']
     )
     
     print("Fitting encoders and transformers...")
@@ -134,21 +166,42 @@ def train_robust_model(df):
     
     print(f"Final Feature Shape: {X_train_final.shape}")
     
-    # 7. Train Model with Weights
-    print("Training XGBoost with Sample Weights...")
+    # 7. Train Model with Sample Weights and Progress Monitoring
+    print("Training XGBoost with sample weights and early stopping...")
+    print("Progress will be shown every 10 iterations...\n")
+
     model = xgb.XGBRegressor(
         n_estimators=600,
         learning_rate=0.03,
         max_depth=9,
         colsample_bytree=0.7,
         subsample=0.7,
-        min_child_weight=5, # Higher to avoid overfitting to few samples
+        min_child_weight=5,
         objective='reg:absoluteerror',
+        eval_metric='mae',
+        early_stopping_rounds=50,  # Stop if no improvement for 50 rounds
         n_jobs=-1,
         random_state=42
     )
-    
-    model.fit(X_train_final, y_train, sample_weight=w_train)
+
+    # Create validation set for early stopping and progress monitoring
+    val_size = 5000
+    X_val = X_train_final[:val_size]
+    y_val = y_train[:val_size]
+    X_train_sub = X_train_final[val_size:]
+    y_train_sub = y_train[val_size:]
+    w_train_sub = w_train.values[val_size:] if hasattr(w_train, 'values') else w_train[val_size:]
+
+    print(f"Training samples: {len(X_train_sub):,} | Validation samples: {len(X_val):,}\n")
+
+    # Fit with progress monitoring
+    model.fit(
+        X_train_sub,
+        y_train_sub,
+        sample_weight=w_train_sub,
+        eval_set=[(X_val, y_val)],
+        verbose=10  # Print every 10 iterations
+    )
     
     # 8. Evaluate
     print("Evaluating...")
@@ -160,11 +213,29 @@ def train_robust_model(df):
     rmse = np.sqrt(mean_squared_error(y_test_days, y_pred))
     r2 = r2_score(y_test_days, y_pred)
     
-    print(f"\n--- Deep Thought Model Performance ---")
+    print(f"\n--- Overall Model Performance ---")
     print(f"MAE:  {mae:.2f} days")
     print(f"RMSE: {rmse:.2f} days")
     print(f"R2:   {r2:.4f}")
-    
+
+    # Stratified Evaluation by Range
+    print("\n--- Performance by Target Range ---")
+    stratified_metrics = evaluate_by_bins(y_test_days, y_pred, bins, labels)
+
+    for bin_label, metrics in stratified_metrics.items():
+        if metrics['count'] > 0:
+            print(f"{bin_label:12s} | MAE: {metrics['mae']:6.2f} | RMSE: {metrics['rmse']:6.2f} | "
+                  f"R2: {metrics['r2']:6.4f} | n={metrics['count']:5d} | "
+                  f"Mean True: {metrics['mean_true']:6.2f} | Mean Pred: {metrics['mean_pred']:6.2f}")
+
+    # Calculate balance score
+    balance_score = calculate_balance_score(stratified_metrics)
+    print(f"\nBalance Score (CV of MAEs): {balance_score:.4f} (lower = more balanced)")
+
+    # Extract high-value and low-value MAEs for history
+    mae_high_value = stratified_metrics.get('180-365d', {}).get('mae', np.nan)
+    mae_low_value = stratified_metrics.get('0-7d', {}).get('mae', np.nan)
+
     # 9. Save Artifacts
     print("Saving artifacts...")
     artifacts = {
@@ -202,8 +273,11 @@ def train_robust_model(df):
         'mae': mae,
         'rmse': rmse,
         'r2': r2,
+        'mae_high_value': mae_high_value,
+        'mae_low_value': mae_low_value,
+        'balance_score': balance_score,
         'filename': version_filename,
-        'description': 'Robust Model (Linear Encoding, No Urgency, Capped 365)'
+        'description': 'Hybrid Resampling V2 (33-18-17-17-15 distribution, aggressive 90+ oversample, 2% noise, sample weights)'
     }
     
     history_df = pd.DataFrame([history_entry])
@@ -214,13 +288,17 @@ def train_robust_model(df):
         history_df.to_csv(history_path, mode='w', header=True, index=False)
     
     print(f"Logged history to {history_path}")
-    
-    # Save Plot
-    plt.figure(figsize=(10, 6))
-    sns.scatterplot(x=y_test_days[:2000], y=y_pred[:2000], alpha=0.3)
-    plt.plot([0, 365], [0, 365], 'r--')
-    plt.title(f"Robust Model (MAE: {mae:.2f})")
-    plt.savefig(os.path.join(MODEL_DIR, f"prediction_scatter_{timestamp}.png"))
+
+    # Save Enhanced Visualization
+    plot_path = os.path.join(MODEL_DIR, f"prediction_scatter_{timestamp}.png")
+    plot_predictions_by_range(
+        y_test_days,
+        y_pred,
+        bins,
+        labels,
+        plot_path,
+        title=f"Hybrid Resampling Model (MAE: {mae:.2f})"
+    )
 
 if __name__ == "__main__":
     df = load_data()
