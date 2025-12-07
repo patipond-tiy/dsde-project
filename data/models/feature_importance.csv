@@ -1,0 +1,11 @@
+feature,importance
+type_clean,0.2717424
+district,0.15234725
+month,0.11430818
+is_weekend,0.08525107
+temperature_min,0.07277138
+comment_length,0.071299426
+rainfall_mm,0.07111772
+temperature_max,0.063273035
+day_of_week,0.050455693
+hour,0.047433913

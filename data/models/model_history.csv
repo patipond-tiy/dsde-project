@@ -1,0 +1,2 @@
+timestamp,mae,rmse,r2,filename,description
+20251207_102633,23.971813159385604,55.51106865421764,0.09995552593579637,resolution_model_20251207_102633.joblib,"Robust Model (No Urgency, Capped 365, Smooth Auto)"
